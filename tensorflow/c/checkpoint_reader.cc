@@ -126,7 +126,13 @@ CheckpointReader::BuildV2VarMaps() {
   absl::flat_hash_set<std::string> filtered_keys;
   BundleEntryProto entry;
   v2_reader_->Seek(kHeaderEntryKey);
-  for (v2_reader_->Next(); v2_reader_->Valid(); v2_reader_->Next()) {
+  // Seek() can leave the iterator invalid (with a null data block iterator) if
+  // reading the data block fails (e.g. on an I/O or deadline error), and
+  // Next() requires Valid().
+  if (v2_reader_->Valid()) {
+    v2_reader_->Next();
+  }
+  for (; v2_reader_->Valid(); v2_reader_->Next()) {
     CHECK(entry.ParseFromString(v2_reader_->value()))
         << entry.InitializationErrorString();
     for (int i = 0; i < entry.slices_size(); ++i) {
@@ -145,7 +151,13 @@ CheckpointReader::BuildV2VarMaps() {
   std::unique_ptr<TensorSliceReader::VarToDataTypeMap> var_to_data_type_map(
       new TensorSliceReader::VarToDataTypeMap);
   v2_reader_->Seek(kHeaderEntryKey);
-  for (v2_reader_->Next(); v2_reader_->Valid(); v2_reader_->Next()) {
+  // The first pass resets the data block iterator on completion, so this Seek()
+  // re-reads the first data block from disk and can leave the iterator invalid
+  // if that read fails.
+  if (v2_reader_->Valid()) {
+    v2_reader_->Next();
+  }
+  for (; v2_reader_->Valid(); v2_reader_->Next()) {
     if (filtered_keys.count(v2_reader_->key()) > 0) continue;
     CHECK(entry.ParseFromString(v2_reader_->value()))
         << entry.InitializationErrorString();
