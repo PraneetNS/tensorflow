@@ -29,7 +29,14 @@ limitations under the License.
 
 #include "tensorflow/core/kernels/strided_slice_op.h"
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <type_traits>
+
 #include "absl/base/prefetch.h"
+#include "absl/types/span.h"
 #include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
 #include "tensorflow/core/framework/bounds_check.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -87,6 +94,121 @@ struct MemCpyFunctor<ResourceHandle> {
   }
 };
 
+constexpr size_t kMinSliceAlignBytes = 16;
+constexpr size_t kGpuNonZeroOffsetAlignBytes = 256;
+
+bool IsFullDimensionSlice(const Tensor& input, int dim,
+                          absl::Span<const int64_t> begin,
+                          absl::Span<const int64_t> end,
+                          absl::Span<const int64_t> strides) {
+  return strides[dim] == 1 && begin[dim] == 0 &&
+         end[dim] == input.dim_size(dim);
+}
+
+// Finds the single dimension being sliced when all leading dimensions have size
+// 1 (taken in full or shrunk), the sliced dimension has unit stride, and all
+// trailing dimensions are taken in full.
+std::optional<int> FindContiguousSliceDim(const Tensor& input,
+                                          absl::Span<const int64_t> begin,
+                                          absl::Span<const int64_t> end,
+                                          absl::Span<const int64_t> strides) {
+  const int dims = input.dims();
+  int slice_dim = 0;
+  while (slice_dim < dims && input.dim_size(slice_dim) == 1 &&
+         IsFullDimensionSlice(input, slice_dim, begin, end, strides)) {
+    ++slice_dim;
+  }
+  if (slice_dim >= dims || strides[slice_dim] != 1) {
+    return std::nullopt;
+  }
+  for (int dim = slice_dim + 1; dim < dims; ++dim) {
+    if (!IsFullDimensionSlice(input, dim, begin, end, strides)) {
+      return std::nullopt;
+    }
+  }
+  return slice_dim;
+}
+
+// Collapses leading size-1 dimensions `[0, slice_dim)` into a zero-copy view so
+// `slice_dim` becomes dimension 0 for `Tensor::Slice`.
+std::optional<Tensor> CollapseLeadingUnitDims(const Tensor& input,
+                                              int slice_dim) {
+  if (slice_dim == 0) {
+    return input;
+  }
+  TensorShape collapsed_shape;
+  for (int dim = slice_dim; dim < input.dims(); ++dim) {
+    if (!collapsed_shape.AddDimWithStatus(input.dim_size(dim)).ok()) {
+      return std::nullopt;
+    }
+  }
+  Tensor collapsed;
+  if (!collapsed.CopyFrom(input, collapsed_shape)) {
+    return std::nullopt;
+  }
+  return collapsed;
+}
+
+template <typename Device, typename T>
+bool IsSlicePointerAligned(const Tensor& collapsed, int64_t slice_start,
+                           int64_t slice_end) {
+  const int64_t slice_len = slice_end - slice_start;
+  if (slice_len <= 0 || collapsed.dim_size(0) <= 0 ||
+      collapsed.NumElements() <= 0) {
+    return true;
+  }
+  const int64_t elems_per_slice =
+      collapsed.NumElements() / collapsed.dim_size(0);
+  const uintptr_t slice_ptr = reinterpret_cast<uintptr_t>(collapsed.data()) +
+                              static_cast<uintptr_t>(slice_start) *
+                                  static_cast<uintptr_t>(elems_per_slice) *
+                                  sizeof(T);
+  // Non-zero accelerator offsets require 256-byte alignment (matching cuBLAS
+  // requirements in gpu_constants.h) unless IsDim0SliceAligned already holds;
+  // offset 0 reuses input.data(), preserving its original allocator alignment.
+  const bool is_accelerator = !std::is_same_v<Device, CPUDevice>;
+  const size_t min_align =
+      (is_accelerator && slice_start > 0 &&
+       !IsDim0SliceAligned<T>(collapsed.shape(), slice_start, slice_end))
+          ? kGpuNonZeroOffsetAlignBytes
+          : std::max<size_t>({kMinSliceAlignBytes,
+                              size_t{EIGEN_MAX_ALIGN_BYTES}, alignof(T)});
+  return slice_ptr % min_align == 0;
+}
+
+// Returns a zero-copy `SubBuffer` slice for memcpy-safe types when the slice is
+// contiguous in memory and its starting address is aligned.
+template <typename Device, typename T>
+std::optional<Tensor> TrySliceContiguousBuffer(
+    const Tensor& input, absl::Span<const int64_t> begin,
+    absl::Span<const int64_t> end, absl::Span<const int64_t> strides,
+    const TensorShape& final_shape) {
+  if (!DataTypeCanUseMemcpy(DataTypeToEnum<T>::v()) || input.dims() < 1 ||
+      !input.IsAligned()) {
+    return std::nullopt;
+  }
+  std::optional<int> slice_dim =
+      FindContiguousSliceDim(input, begin, end, strides);
+  if (!slice_dim.has_value()) {
+    return std::nullopt;
+  }
+  std::optional<Tensor> collapsed = CollapseLeadingUnitDims(input, *slice_dim);
+  if (!collapsed.has_value()) {
+    return std::nullopt;
+  }
+  const int64_t slice_start = std::min(begin[*slice_dim], end[*slice_dim]);
+  const int64_t slice_end = end[*slice_dim];
+  if (!IsSlicePointerAligned<Device, T>(*collapsed, slice_start, slice_end)) {
+    return std::nullopt;
+  }
+  Tensor sliced = collapsed->Slice(slice_start, slice_end);
+  Tensor output;
+  if (!output.CopyFrom(sliced, final_shape)) {
+    return std::nullopt;
+  }
+  return output;
+}
+
 }  // namespace
 
 template <typename Device, typename T>
@@ -142,6 +264,15 @@ class StridedSliceOp : public OpKernel {
       OP_REQUIRES(context, tmp.CopyFrom(slice, final_shape),
                   absl::InternalError("Copy failed"));
       context->set_output(0, tmp);
+      return;
+    }
+
+    if (std::optional<Tensor> sliced = TrySliceContiguousBuffer<Device, T>(
+            input, begin, end, strides, final_shape);
+        sliced.has_value()) {
+      VLOG(1) << "Strided slice contiguous buffer: "
+              << input.shape().DebugString();
+      context->set_output(0, *sliced);
       return;
     }
 
