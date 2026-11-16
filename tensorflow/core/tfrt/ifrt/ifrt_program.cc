@@ -44,6 +44,7 @@ limitations under the License.
 #include "mlir/IR/Builders.h"  // from @llvm-project
 #include "mlir/IR/BuiltinAttributes.h"  // from @llvm-project
 #include "mlir/IR/BuiltinOps.h"  // from @llvm-project
+#include "mlir/IR/MLIRContext.h"  // from @llvm-project
 #include "mlir/IR/OwningOpRef.h"  // from @llvm-project
 #include "mlir/IR/SymbolTable.h"  // from @llvm-project
 #include "mlir/IR/Visitors.h"  // from @llvm-project
@@ -409,6 +410,9 @@ absl::StatusOr<std::unique_ptr<IfrtProgram>> IfrtProgram::Create(
     IfrtPersistentCompilationCache* persistent_compilation_cache,
     bool use_undonatable_buffer_converter,
     absl::Span<const int> assigned_device_ids) {
+  module->getContext()->loadAllAvailableDialects();
+  module->getContext()->enableThreadSafeLocking();
+
   TF_ASSIGN_OR_RETURN(
       tensorflow::tpu::TPUCompileMetadataProto original_compile_metadata,
       GetCompileMetadata(*module, *client));
@@ -641,11 +645,13 @@ IfrtProgram::CreateExecutableSynchronously(
     }
   }
 
-  TF_ASSIGN_OR_RETURN(
-      mlir::OwningOpRef<mlir::ModuleOp> mlir_hlo_module,
-      ::xla::ConvertHloToStablehloWithOptions(
-          *module_copy->getContext(), &tf2hlo_result.hlo_module_proto,
-          /*import_all_computations=*/false));
+  auto hlo_context = std::make_shared<mlir::MLIRContext>(
+      mlir::MLIRContext::Threading::DISABLED);
+  hlo_context->enableThreadSafeLocking();
+  TF_ASSIGN_OR_RETURN(mlir::OwningOpRef<mlir::ModuleOp> mlir_hlo_module,
+                      ::xla::ConvertHloToStablehloWithOptions(
+                          *hlo_context, &tf2hlo_result.hlo_module_proto,
+                          /*import_all_computations=*/false));
 
   if (VLOG_IS_ON(1)) {
     tensorflow::DumpMlirOpToFile("ifrt_after_bridge_phase2",
@@ -738,8 +744,8 @@ IfrtProgram::CreateExecutableSynchronously(
             ifrt_client_.get(),
             std::make_unique<xla::HostCallback>(host_callback)));
   }
-  auto hlo_program =
-      std::make_unique<xla::ifrt::HloProgram>(mlir_hlo_module.get());
+  auto hlo_program = std::make_unique<xla::ifrt::HloProgram>(
+      std::move(hlo_context), std::move(mlir_hlo_module));
   auto compiled = std::make_shared<CompiledExecutable>();
 
   TF_ASSIGN_OR_RETURN(

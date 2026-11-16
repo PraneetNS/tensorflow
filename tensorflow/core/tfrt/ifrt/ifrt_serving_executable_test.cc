@@ -16,6 +16,7 @@ limitations under the License.
 #include "tensorflow/core/tfrt/ifrt/ifrt_serving_executable.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -33,6 +34,8 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/blocking_counter.h"
+#include "absl/synchronization/notification.h"
 #include "absl/types/span.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"  // from @llvm-project
 #include "mlir/IR/BuiltinAttributes.h"  // from @llvm-project
@@ -59,6 +62,7 @@ limitations under the License.
 #include "xla/tsl/framework/test_util/mock_serving_device_selector.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/lib/monitoring/cell_reader.h"
+#include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/threadpool.h"
 #include "xla/xla_data.pb.h"
@@ -983,6 +987,52 @@ TEST(GetInputDonationMaskTest, OutOfRangeDonatedParameterFails) {
                 .status()
                 .code(),
             absl::StatusCode::kInternal);
+}
+
+TEST_P(IfrtServingExecutableTest, ConcurrentCompilationAcrossDistinctShapes) {
+  constexpr int kNumShapes = 8;
+  constexpr int64_t kProgramId = 234567;
+  std::atomic<int> next_device = 0;
+  const int num_cores = std::max(1, helper_->num_cores());
+  EXPECT_CALL(selector_, ReserveDevice(absl::StrCat(kProgramId)))
+      .WillRepeatedly([&next_device, num_cores](::testing::Unused) {
+        return tsl::DeviceReservation(next_device.fetch_add(1) % num_cores,
+                                      /*selector=*/nullptr);
+      });
+
+  std::unique_ptr<IfrtServingExecutable> executable =
+      helper_->MakeExecutable(kProgramId, GetMlirModulePath("executable.mlir"));
+
+  absl::BlockingCounter ready(kNumShapes);
+  absl::Notification go;
+  std::vector<absl::StatusOr<std::vector<tensorflow::Tensor>>> results(
+      kNumShapes);
+  {
+    tsl::thread::ThreadPool pool(tsl::Env::Default(), tsl::ThreadOptions(),
+                                 "ConcurrentCompile", kNumShapes);
+    for (int t = 0; t < kNumShapes; ++t) {
+      pool.Schedule([&, t]() {
+        std::vector<int32_t> values(t + 1, 1);
+        std::vector<tensorflow::Tensor> inputs{
+            AsTensor<int32_t>(values, tensorflow::TensorShape({1, t + 1})),
+            AsTensor<int32_t>(values, tensorflow::TensorShape({t + 1, 1})),
+        };
+        ready.DecrementCount();
+        go.WaitForNotification();
+        results[t] = Execute(executable.get(), absl::MakeSpan(inputs), {});
+      });
+    }
+    ready.Wait();
+    go.Notify();
+  }
+
+  for (int t = 0; t < kNumShapes; ++t) {
+    ASSERT_OK_AND_ASSIGN(std::vector<tensorflow::Tensor> outputs,
+                         std::move(results[t]));
+    EXPECT_THAT(outputs, ElementsAre(TensorEq(AsTensor<int32_t>(
+                             {t + 1}, tensorflow::TensorShape({1, 1})))));
+  }
+  EXPECT_EQ(executable->num_executables(), kNumShapes);
 }
 
 }  // namespace
