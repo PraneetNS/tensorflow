@@ -1040,16 +1040,46 @@ absl::Status EagerContextDistributedManager::EnableCollectiveOps(
     const ServerDef& server_def) {
   ServerInterface* server = context_->GetServer();
   if (server == nullptr) {
+    const auto& config = server_def.default_session_config();
+    const bool enable_coordination =
+        !config.experimental().coordination_config().service_type().empty();
+
+    // Convert nested "job name" and "task index" into a flat "node_id" index
+    // in 0..num_nodes-1. num_nodes is the sum of the number of tasks in each
+    // job.
+    int num_nodes = 0;
+    int node_id = -1;
+    const std::string& job_name = server_def.job_name();
+    int task_index = server_def.task_index();
+    for (const auto& job : server_def.cluster().job()) {
+      if (job.name() == job_name) {
+        node_id = num_nodes + task_index;
+      }
+      num_nodes += job.tasks().size();
+    }
+
     std::unique_ptr<ServerInterface> new_server;
-    LOG_AND_RETURN_IF_ERROR(NewServer(server_def, &new_server));
+    if (enable_coordination && num_nodes > 1) {
+      // Allow creation of a PjRt client that knows about remote devices so
+      // collectives will work with MultiWorkerMirroredStrategy. Only populate
+      // this when CreatePjRtGpuClientWithDistributedDevices will subsequently
+      // consume it and replace the process-global PjRt GPU client; otherwise
+      // BaseGPUDeviceFactory would allocate new GPU streams that diverge from
+      // the existing PjRt client's streams.
+      ServerDef server_def_for_server = server_def;
+      server_def_for_server.mutable_default_session_config()
+          ->mutable_gpu_options()
+          ->mutable_experimental()
+          ->set_populate_pjrt_gpu_client_creation_info(true);
+      LOG_AND_RETURN_IF_ERROR(NewServer(server_def_for_server, &new_server));
+    } else {
+      LOG_AND_RETURN_IF_ERROR(NewServer(server_def, &new_server));
+    }
     server = new_server.get();
     if (server == nullptr) {
       LOG_AND_RETURN_IF_ERROR(absl::InternalError(
           "Currently, TF eager runtime only supports GrpcServer."));
     }
-    const auto& config = server_def.default_session_config();
-    const bool enable_coordination =
-        !config.experimental().coordination_config().service_type().empty();
     if (enable_coordination) {
       auto session_name = absl::StrCat("eager_", context_->GetContextId());
       std::shared_ptr<WorkerSession> worker_session;
@@ -1108,20 +1138,6 @@ absl::Status EagerContextDistributedManager::EnableCollectiveOps(
       LOG_AND_RETURN_IF_ERROR(
           coordination_service_agent_->WaitForAllTasks(devices));
       // Coordination service agent is now connected.
-
-      // Convert nested "job name" and "task index" into a flat "node_id" index
-      // in 0..num_nodes-1. num_nodes is the sum of the number of tasks in each
-      // job.
-      int num_nodes = 0;
-      int node_id = -1;
-      const std::string& job_name = server_def.job_name();
-      int task_index = server_def.task_index();
-      for (const auto& job : server_def.cluster().job()) {
-        if (job.name() == job_name) {
-          node_id = num_nodes + task_index;
-        }
-        num_nodes += job.tasks().size();
-      }
       VLOG(2)
           << "Creating PJRT client with distributed devices with num_nodes: "
           << num_nodes << ", node_id: " << node_id;
